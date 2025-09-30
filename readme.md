@@ -6,7 +6,7 @@ the audio processing tools
 
 ```bash
 uv init
-uv add soundcard==0.4.5 numpy scipy
+uv add soundcard==0.4.5 numpy==2.2.6 scipy==1.16.2
 ```
 
 ## quick setup

@@ -36,6 +36,8 @@ class App(tk.Tk):
         self.audio_q = queue.Queue(maxsize=100)   # UI용
         self.send_q  = queue.Queue(maxsize=200)   # 서버 전송용
         self.stop_event = threading.Event()
+        self.stop_event_net = threading.Event()
+        
         self.cap_thread = None
         self.net_thread = None
         self.current_dbfs = self.DBFS_FLOOR
@@ -56,6 +58,26 @@ class App(tk.Tk):
         self._build_ui()
         self.after(33, self._ui_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # __init__ 안의 상태들 옆에 추가
+        self.ui_q = queue.Queue(maxsize=200)  # 상태/알림용 큐
+
+    # 클래스 내부 어디든 (예: 유틸 섹션) 추가
+    def _post_status(self, msg: str):
+        """백그라운드 스레드/코루틴에서 UI에 상태 전달할 때 사용 (스레드-안전)"""
+        try:
+            self.ui_q.put_nowait(('status', msg))
+        except queue.Full:
+            pass
+
+    # 사스널 섹션에 추가    
+    def _post_signal(self, name: str, payload=None):
+        """버튼 토글 등 UI 상태 변경을 위한 시그널 전송 (스레드-안전)"""
+        try:
+            self.ui_q.put_nowait(('signal', name, payload))
+        except queue.Full:
+            pass
+
 
     # ---------- 유틸 ----------
     def _list_loopback_mics(self):
@@ -126,14 +148,16 @@ class App(tk.Tk):
 
     # ---------- 네트워킹 ----------
     async def _net_sender(self, host, port, checkcode, wait_ack, do_ping):
-        self._set_status(f"[NET] connect {host}:{port} ...")
+        self._post_status(f"[NET] connect {host}:{port} ...")
         try:
             reader, writer = await asyncio.open_connection(host, port)
         except Exception as e:
-            self._set_status(f"[NET] connect fail: {e}")
+            self._post_status(f"[NET] connect fail: {e}")
+            self._post_signal('net_connect_fail', str(e))
             return
 
-        self._set_status("[NET] connected")
+        self._post_status("[NET] connected")
+        self._post_signal('net_connected', None)
 
         if do_ping:
             try:
@@ -141,12 +165,15 @@ class App(tk.Tk):
                 await writer.drain()
                 ack = await reader.readexactly(9)
                 _, _, st = struct.unpack("!iiB", ack)
-                self._set_status(f"[NET] ping status={st}")
+                self._post_status(f"[NET] ping status={st}")
+                self._post_signal('net_ping_ok', int(st))
+
             except Exception as e:
-                self._set_status(f"[NET] ping fail: {e}")
+                self._post_status(f"[NET] ping fail: {e}")
+                self._post_signal('net_send_fail', str(e))
 
         try:
-            while not self.stop_event.is_set():
+            while not self.stop_event_net.is_set():
                 try:
                     data = self.send_q.get_nowait()
                 except queue.Empty:
@@ -162,62 +189,80 @@ class App(tk.Tk):
                         ack = await reader.readexactly(9)
                         _, _, st = struct.unpack("!iiB", ack)
                         if st != 0:
-                            self._set_status(f"[NET] status={st}")
+                            self._post_status(f"[NET] status={st}")  
+                            self._post_signal('net_ack_nonzero', int(st))   
+                                                   
                 except Exception as e:
-                    self._set_status(f"[NET] send fail: {e}")
+                    self._post_status(f"[NET] send fail: {e}")
+                    self._post_signal('net_send_fail', str(e))
                     break
         finally:
             writer.close()
             await writer.wait_closed()
-            self._set_status("[NET] disconnected")
+            self._post_status("[NET] disconnected")
+            self._post_signal('net_disconnected', None)
 
     def _net_thread(self, host, port, checkcode, wait_ack, do_ping):
         
         print(f"Net thread start: {host}:{port}, checkcode={checkcode}, wait_ack={wait_ack}, ping={do_ping}")
-        self._set_status("전송 시작")
+        self._post_status("전송 시작")
 
         asyncio.run(self._net_sender(host, port, checkcode, wait_ack, do_ping))
 
     # ---------- UI 루프 ----------
     def _ui_tick(self):
         got = False
-        try:
-            while True:
+
+        # A) 상태/시그널 큐를 먼저 모두 비움 (UI 스레드 안전)
+        while True:
+            try:
+                item = self.ui_q.get_nowait()
+            except queue.Empty:
+                break
+            if not item:
+                continue
+            if item[0] == 'status':
+                _, msg = item
+                self._set_status(msg)
+            elif item[0] == 'signal':
+                _, name, payload = item
+                if name == 'net_connected':
+                    if self.btn_disconnect: self.btn_disconnect.config(state='normal')
+                    if self.btn_connect: self.btn_connect.config(state='disabled')
+                elif name == 'net_connect_fail':
+                    if self.btn_connect: self.btn_connect.config(state='normal')
+                    if self.btn_disconnect: self.btn_disconnect.config(state='disabled')
+                elif name == 'net_disconnected':
+                    if self.btn_connect: self.btn_connect.config(state='normal')
+                    if self.btn_disconnect: self.btn_disconnect.config(state='disabled')
+                elif name == 'net_send_fail':
+                    if self.btn_connect: self.btn_connect.config(state='normal')
+                    if self.btn_disconnect: self.btn_disconnect.config(state='disabled')
+                elif name == 'net_ack_nonzero':
+                    self._set_status(f"[NET] nonzero ACK: {payload}")
+                # net_ping_* 는 상태바만으로 충분
+
+        # B) 오디오 큐를 끝까지 비움 (여기서 dBFS 계산 및 막대 갱신 트리거)
+        while True:
+            try:
                 item = self.audio_q.get_nowait()
-                if isinstance(item, tuple) and "Error" in item[0]:
-                    self._set_status(item[1])
-                    self._stop_capture_ui()
-                    messagebox.showerror("오디오 오류", item[1])
-                    break
-                chunk = item
-                db = self._dbfs_from_chunk(chunk)
+            except queue.Empty:
+                break
 
-                item = self.audio_q.get_nowait()
-
-                # 1) ndarray = 정상 오디오 프레임
-                if isinstance(item, np.ndarray):
-                    db = self._dbfs_from_chunk(item)
-                    self.current_dbfs = (self.RMS_SMOOTH * self.current_dbfs) + ((1 - self.RMS_SMOOTH) * db)
-                    got = True
-                    continue
-
-                # 2) 튜플/메시지 = 상태/에러
-                if isinstance(item, tuple) and len(item) >= 2:
-                    tag = str(item[0]).lower().lstrip('_')  # '__error__' -> 'error'
-                    msg = str(item[1])
-                    if 'error' in tag:
-                        self._set_status(msg)
-                        self._stop_capture_ui()
-                        messagebox.showerror("오디오 오류", msg)
-                        break
-                    # 알 수 없는 메시지는 무시
-                    continue
-
-                # 3) 기타 타입도 무시
+            if isinstance(item, np.ndarray):
+                db = self._dbfs_from_chunk(item)
+                self.current_dbfs = (self.RMS_SMOOTH * self.current_dbfs) + ((1 - self.RMS_SMOOTH) * db)
+                got = True
                 continue
 
-        except queue.Empty:
-            pass
+            if isinstance(item, tuple) and len(item) >= 2:
+                tag = str(item[0]).lower().lstrip('_')
+                msg = str(item[1])
+                if 'error' in tag:
+                    self._set_status(msg)
+                    self._stop_capture_ui()
+                    messagebox.showerror("오디오 오류", msg)
+                    break
 
         if got and self.pbar and self.lbl_db:
             pct = self._dbfs_to_percent(self.current_dbfs)
@@ -263,6 +308,9 @@ class App(tk.Tk):
         host = self.ent_server_ip.get().strip()
         port = int(self.ent_server_port.get())
         checkcode = int(self.ent_checkcode.get())
+
+        self.stop_event_net.clear()
+        
         self.net_thread = threading.Thread(
             target=self._net_thread,
             args=(host, port, checkcode,
@@ -272,15 +320,12 @@ class App(tk.Tk):
         self.net_thread.start()
 
         self.btn_connect.config(state='disabled')
-        self.btn_disconnect.config(state='normal')
-
-        self.btn_connect.config(state='normal')
         self.btn_disconnect.config(state='disabled')
-        self._set_status("대기 중")
+        self._set_status(f"대기 중")
 
 
     def _on_disconnect(self):
-        self.stop_event.set()
+        self.stop_event_net.set()
         if self.net_thread:
             self.net_thread.join()
             self.net_thread = None
