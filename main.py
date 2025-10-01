@@ -52,7 +52,7 @@ class App(tk.Tk):
         self.ent_server_ip = None
         self.ent_server_port = None
         self.ent_checkcode = None
-        self.var_wait_ack = tk.BooleanVar(value=False)
+        self.var_wait_ack = tk.BooleanVar(value=True)
         self.var_ping_on_start = tk.BooleanVar(value=True)
 
         self._build_ui()
@@ -187,7 +187,11 @@ class App(tk.Tk):
                     await writer.drain()
                     if wait_ack:
                         ack = await reader.readexactly(9)
-                        _, _, st = struct.unpack("!iiB", ack)
+                        checkcode, _, st = struct.unpack("!iiB", ack)
+                        if checkcode != self.checkcode:
+                            self._post_status(f"[NET] ACK CHECKCODE mismatch: recv={checkcode}, expected={self.checkcode}")
+                            self._post_signal('net_send_fail', 'ACK CHECKCODE mismatch')
+                            break
                         if st != 0:
                             self._post_status(f"[NET] status={st}")  
                             self._post_signal('net_ack_nonzero', int(st))   
