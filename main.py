@@ -7,15 +7,20 @@
 #desc: 스피커 출력(Loopback) 오디오 캡처 후 RMS dBFS 게이지 표시.
 #########################################################
 
+print("importing...")
 import threading
 import queue
 import numpy as np
 import soundcard as sc
+
+print("import tkinter...")
 import tkinter as tk
 from tkinter import ttk, messagebox
 import struct
 import asyncio
 from scipy.signal import resample_poly
+
+print("import done.")
 
 REQUEST_STT  = 0x01
 REQUEST_PING = 99
@@ -28,9 +33,11 @@ class App(tk.Tk):
     RMS_SMOOTH  = 0.2
     DBFS_FLOOR  = -60.0
 
+    __VERSION__ = '0.0.1'
+
     def __init__(self):
         super().__init__()
-        self.title("Loopback RMS + Server (16kHz downsample)")
+        self.title(f"Loopback RMS + Server (16kHz downsample) version {self.__VERSION__}")
 
         # 상태
         self.audio_q = queue.Queue(maxsize=100)   # UI용
@@ -61,6 +68,8 @@ class App(tk.Tk):
 
         # __init__ 안의 상태들 옆에 추가
         self.ui_q = queue.Queue(maxsize=200)  # 상태/알림용 큐
+
+        print("start App")
 
     # 클래스 내부 어디든 (예: 유틸 섹션) 추가
     def _post_status(self, msg: str):
@@ -402,4 +411,5 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    print("Starting mainloop...")
     App().mainloop()
