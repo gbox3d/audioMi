@@ -33,7 +33,7 @@ class App(tk.Tk):
     RMS_SMOOTH  = 0.2
     DBFS_FLOOR  = -60.0
 
-    __VERSION__ = '0.0.1'
+    __VERSION__ = '0.0.2'
 
     def __init__(self):
         super().__init__()
@@ -168,6 +168,8 @@ class App(tk.Tk):
         self._post_status("[NET] connected")
         self._post_signal('net_connected', None)
 
+        print(f"connected to {host}:{port}")
+
         if do_ping:
             try:
                 writer.write(struct.pack("!ii", checkcode, REQUEST_PING))
@@ -176,10 +178,13 @@ class App(tk.Tk):
                 _, _, st = struct.unpack("!iiB", ack)
                 self._post_status(f"[NET] ping status={st}")
                 self._post_signal('net_ping_ok', int(st))
-
+                print("ping ok")
             except Exception as e:
                 self._post_status(f"[NET] ping fail: {e}")
                 self._post_signal('net_send_fail', str(e))
+        else:
+            self._post_status("[NET] (ping skipped)")
+            print("ping skipped")
 
         try:
             while not self.stop_event_net.is_set():
@@ -196,9 +201,9 @@ class App(tk.Tk):
                     await writer.drain()
                     if wait_ack:
                         ack = await reader.readexactly(9)
-                        checkcode, _, st = struct.unpack("!iiB", ack)
-                        if checkcode != self.checkcode:
-                            self._post_status(f"[NET] ACK CHECKCODE mismatch: recv={checkcode}, expected={self.checkcode}")
+                        _checkcode, _, st = struct.unpack("!iiB", ack)
+                        if _checkcode != checkcode:
+                            self._post_status(f"[NET] ACK CHECKCODE mismatch: recv={_checkcode}, expected={checkcode}")
                             self._post_signal('net_send_fail', 'ACK CHECKCODE mismatch')
                             break
                         if st != 0:
