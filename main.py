@@ -1,420 +1,292 @@
-########################################################
-#위 주석은 수정하시 마세요.
-#file: lookback_rms.py
-#author: gbox3d
-#date: 2025-09-29
-#환경 : uv add soundcard==0.4.5 numpy scipy
-#desc: 스피커 출력(Loopback) 오디오 캡처 후 RMS dBFS 게이지 표시.
+# main.py
+#########################################################
+# 위 주석은 수정하지 마세요.
+# file: main.py
+# author: gbox3d
+# date: 2025-11-13
+# env : uv add soundcard==0.4.5 numpy scipy
+# desc: 스피커 출력(Loopback)을 캡처하여
+#       TCP 클라이언트에 실시간 오디오 스트림(커맨드 1) 푸시.
+#       Tkinter UI 로 서버를 제어.
 #########################################################
 
-print("importing...")
-import threading
-import queue
-import numpy as np
-import soundcard as sc
+from dotenv import load_dotenv
+import os
 
-print("import tkinter...")
+import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
-import struct
-import asyncio
-from scipy.signal import resample_poly
 
-print("import done.")
+from audio_module import (
+    AudioCapture,
+    list_loopback_mics,
+    dbfs_from_chunk,   # 직접 쓰진 않지만 필요하면 사용 가능
+)
+from net_server import NetAudioServer
 
-REQUEST_STT  = 0x01
-REQUEST_PING = 99
 
 
 class App(tk.Tk):
-    SAMPLE_RATE = 48000   # 캡처는 48kHz
-    TARGET_SR   = 16000   # 서버 전송은 16kHz
-    CHUNK       = 1024
-    RMS_SMOOTH  = 0.2
-    DBFS_FLOOR  = -60.0
-
-    __VERSION__ = '0.0.2'
+    DBFS_FLOOR = -60.0
+    RMS_SMOOTH = 0.2
+    __VERSION__ = "0.1.0"
 
     def __init__(self):
         super().__init__()
-        self.title(f"Loopback RMS + Server (16kHz downsample) version {self.__VERSION__}")
-
-        # 상태
-        self.audio_q = queue.Queue(maxsize=100)   # UI용
-        self.send_q  = queue.Queue(maxsize=200)   # 서버 전송용
-        self.stop_event = threading.Event()
-        self.stop_event_net = threading.Event()
         
-        self.cap_thread = None
-        self.net_thread = None
+        # .env 값 읽기
+        load_dotenv()
+        self.default_host = os.getenv("HOST", "0.0.0.0")
+        self.default_port = os.getenv("PORT", "26070")
+        self.default_checkcode = os.getenv("CHECKCODE", "20250918")
+        
+        
+        self.title(f"Loopback Audio Server v{self.__VERSION__}")
+
+        # 큐: UI 갱신용
+        self.ui_q = queue.Queue(maxsize=200)
+
+        # 오디오 데이터 전송용 큐
+        self.send_q = queue.Queue(maxsize=200)
+
+        self.mics = []
+        self.audio_capture = None
+        self.server = None
+
         self.current_dbfs = self.DBFS_FLOOR
 
-        # UI 변수
+        # UI 위젯 핸들
         self.cmb_devices = None
+        self.ent_host = None
+        self.ent_port = None
+        self.ent_checkcode = None
         self.btn_start = None
         self.btn_stop = None
-        self.lbl_db = None
         self.pbar = None
+        self.lbl_db = None
         self.statusbar = None
-        self.ent_server_ip = None
-        self.ent_server_port = None
-        self.ent_checkcode = None
-        self.var_wait_ack = tk.BooleanVar(value=True)
-        self.var_ping_on_start = tk.BooleanVar(value=True)
 
         self._build_ui()
+        self._load_devices()
+
         self.after(33, self._ui_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # __init__ 안의 상태들 옆에 추가
-        self.ui_q = queue.Queue(maxsize=200)  # 상태/알림용 큐
-
-        print("start App")
-
-    # 클래스 내부 어디든 (예: 유틸 섹션) 추가
-    def _post_status(self, msg: str):
-        """백그라운드 스레드/코루틴에서 UI에 상태 전달할 때 사용 (스레드-안전)"""
+    # ---------- 내부 유틸 ----------
+    def _post_ui(self, item):
         try:
-            self.ui_q.put_nowait(('status', msg))
+            self.ui_q.put_nowait(item)
         except queue.Full:
             pass
 
-    # 사스널 섹션에 추가    
-    def _post_signal(self, name: str, payload=None):
-        """버튼 토글 등 UI 상태 변경을 위한 시그널 전송 (스레드-안전)"""
-        try:
-            self.ui_q.put_nowait(('signal', name, payload))
-        except queue.Full:
-            pass
+    def _log(self, tag: str, payload=None):
+        self._post_ui(("server_event", tag, payload))
 
+    def _on_audio_level(self, db: float):
+        self._post_ui(("level", db))
 
-    # ---------- 유틸 ----------
-    def _list_loopback_mics(self):
-        mics = sc.all_microphones(include_loopback=True)
-
-        def is_loopback(m):
-            return getattr(m, "isloopback", False) or "loopback" in m.name.lower()
-
-        loopbacks = [m for m in mics if is_loopback(m)]
-        try:
-            default_lb = sc.default_speaker().loopback_microphone()
-            loopbacks = [default_lb] + [m for m in loopbacks if m.name != default_lb.name]
-        except Exception:
-            pass
-        return loopbacks if loopbacks else mics
-
-    @staticmethod
-    def _dbfs_from_chunk(chunk: np.ndarray) -> float:
-        if chunk.ndim == 2:
-            mono = np.mean(chunk, axis=1)
-        else:
-            mono = chunk
-        rms = np.sqrt(np.mean(np.square(mono), dtype=np.float64) + 1e-12)
-        return min(20 * np.log10(rms + 1e-12), 0.0)
+    def _on_audio_error(self, e: Exception):
+        self._post_ui(("error", f"[AUDIO] {e}"))
 
     def _dbfs_to_percent(self, dbfs: float) -> int:
         v = (dbfs - self.DBFS_FLOOR) / (0.0 - self.DBFS_FLOOR)
         return int(round(max(0.0, min(1.0, v)) * 100))
 
-    @staticmethod
-    def _float32_to_pcm16_resampled(chunk: np.ndarray, in_sr: int, out_sr: int) -> bytes:
-        """float32 [-1,1] → mono int16 bytes (resampled)"""
-        if chunk.ndim == 2:
-            mono = np.mean(chunk, axis=1)
+    # ---------- UI 빌드 ----------
+    def _build_ui(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        # 장치 선택
+        ttk.Label(frm, text="Loopback 장치").pack(anchor="w")
+        self.cmb_devices = ttk.Combobox(frm, state="readonly", width=50)
+        self.cmb_devices.pack(anchor="w", fill="x", pady=(0, 8))
+
+        # 서버 설정
+        f_srv = ttk.Frame(frm)
+        f_srv.pack(fill="x", pady=4)
+
+        ttk.Label(f_srv, text="Host").grid(row=0, column=0, sticky="w")
+        self.ent_host = ttk.Entry(f_srv, width=15)
+        self.ent_host.grid(row=0, column=1, padx=4)
+        self.ent_host.insert(0, self.default_host)
+
+        ttk.Label(f_srv, text="Port").grid(row=0, column=2, sticky="w")
+        self.ent_port = ttk.Entry(f_srv, width=8)
+        self.ent_port.grid(row=0, column=3, padx=4)
+        self.ent_port.insert(0, self.default_port)
+
+        ttk.Label(f_srv, text="Checkcode").grid(row=0, column=4, sticky="w")
+        self.ent_checkcode = ttk.Entry(f_srv, width=12)
+        self.ent_checkcode.grid(row=0, column=5, padx=4)
+        self.ent_checkcode.insert(0, self.default_checkcode)
+
+        for i in range(6):
+            f_srv.columnconfigure(i, weight=1 if i in (1, 3, 5) else 0)
+
+        # 레벨 바
+        self.pbar = ttk.Progressbar(
+            frm,
+            orient="horizontal",
+            length=420,
+            mode="determinate",
+            maximum=100,
+        )
+        self.pbar.pack(fill="x", pady=6)
+        self.lbl_db = ttk.Label(frm, text="RMS: --- dBFS")
+        self.lbl_db.pack(anchor="w")
+        
+        self.lbl_clients = ttk.Label(self, text="Clients: 0", anchor="w")
+        self.lbl_clients.pack(side="bottom", fill="x")
+
+
+        # 버튼
+        f_btn = ttk.Frame(frm)
+        f_btn.pack(fill="x", pady=8)
+
+        self.btn_start = ttk.Button(f_btn, text="캡처 + 서버 시작", command=self._start)
+        self.btn_start.pack(side="left", padx=4)
+
+        self.btn_stop = ttk.Button(
+            f_btn, text="정지", command=self._stop, state="disabled"
+        )
+        self.btn_stop.pack(side="left", padx=4)
+
+        # 상태바
+        self.statusbar = ttk.Label(
+            self, text="대기 중", anchor="w", relief="sunken"
+        )
+        self.statusbar.pack(side="bottom", fill="x")
+
+    def _load_devices(self):
+        self.mics = list_loopback_mics()
+        if not self.mics:
+            self.cmb_devices["values"] = ["(Loopback 장치 없음)"]
+            self.cmb_devices.current(0)
+            self._log("Loopback 장치를 찾을 수 없습니다.")
         else:
-            mono = chunk
-        mono = np.clip(mono, -1.0, 1.0)
+            names = [m.name for m in self.mics]
+            self.cmb_devices["values"] = names
+            self.cmb_devices.current(0)
+            self._log(f"Loopback 장치 {len(self.mics)}개 발견")
 
-        if in_sr != out_sr:
-            gcd = np.gcd(in_sr, out_sr)
-            up, down = out_sr // gcd, in_sr // gcd
-            mono = resample_poly(mono, up, down)
-
-        pcm16 = (mono * 32767.0).astype(np.int16)
-        return pcm16.tobytes()
-
-    # ---------- 캡처 ----------
-    def _capture_worker(self, mic):
-        try:
-            with mic.recorder(samplerate=self.SAMPLE_RATE) as rec:
-                while not self.stop_event.is_set():
-                    data = rec.record(numframes=self.CHUNK)
-                    # UI
-                    try:
-                        self.audio_q.put_nowait(data)
-                    except queue.Full:
-                        pass
-                    # 전송용
-                    try:
-                        pcm = self._float32_to_pcm16_resampled(data, self.SAMPLE_RATE, self.TARGET_SR)
-                        self.send_q.put_nowait(pcm)
-                    except queue.Full:
-                        pass
-        except Exception as e:
-            # self.audio_q.put(('__error__', f"CaptureError: {e}"))
-            # self.audio_q.put(('error', f"CaptureError: {e}"))
-            print(f"CaptureError: {e}")
-
-    # ---------- 네트워킹 ----------
-    async def _net_sender(self, host, port, checkcode, wait_ack, do_ping):
-        self._post_status(f"[NET] connect {host}:{port} ...")
-        try:
-            reader, writer = await asyncio.open_connection(host, port)
-        except Exception as e:
-            self._post_status(f"[NET] connect fail: {e}")
-            self._post_signal('net_connect_fail', str(e))
+    # ---------- UI 이벤트 ----------
+    def _start(self):
+        if not self.mics:
+            messagebox.showerror("장치", "Loopback 장치를 찾을 수 없습니다.")
             return
 
-        self._post_status("[NET] connected")
-        self._post_signal('net_connected', None)
+        idx = self.cmb_devices.current()
+        if idx < 0 or idx >= len(self.mics):
+            messagebox.showerror("장치", "Loopback 장치를 선택하세요.")
+            return
+        mic = self.mics[idx]
 
-        print(f"connected to {host}:{port}")
-
-        if do_ping:
-            try:
-                writer.write(struct.pack("!ii", checkcode, REQUEST_PING))
-                await writer.drain()
-                ack = await reader.readexactly(9)
-                _, _, st = struct.unpack("!iiB", ack)
-                self._post_status(f"[NET] ping status={st}")
-                self._post_signal('net_ping_ok', int(st))
-                print("ping ok")
-            except Exception as e:
-                self._post_status(f"[NET] ping fail: {e}")
-                self._post_signal('net_send_fail', str(e))
-        else:
-            self._post_status("[NET] (ping skipped)")
-            print("ping skipped")
-
+        host = self.ent_host.get().strip()
         try:
-            while not self.stop_event_net.is_set():
-                try:
-                    data = self.send_q.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.01)
-                    continue
+            port = int(self.ent_port.get().strip())
+            checkcode = int(self.ent_checkcode.get().strip())
+        except ValueError:
+            messagebox.showerror("설정", "Port/Checkcode 는 정수여야 합니다.")
+            return
 
-                header = struct.pack("!ii", checkcode, REQUEST_STT)
-                size = struct.pack("!i", len(data))
-                try:
-                    writer.write(header + size + data)
-                    await writer.drain()
-                    if wait_ack:
-                        ack = await reader.readexactly(9)
-                        _checkcode, _, st = struct.unpack("!iiB", ack)
-                        if _checkcode != checkcode:
-                            self._post_status(f"[NET] ACK CHECKCODE mismatch: recv={_checkcode}, expected={checkcode}")
-                            self._post_signal('net_send_fail', 'ACK CHECKCODE mismatch')
-                            break
-                        if st != 0:
-                            self._post_status(f"[NET] status={st}")  
-                            self._post_signal('net_ack_nonzero', int(st))   
-                                                   
-                except Exception as e:
-                    self._post_status(f"[NET] send fail: {e}")
-                    self._post_signal('net_send_fail', str(e))
-                    break
-        finally:
-            writer.close()
-            await writer.wait_closed()
-            self._post_status("[NET] disconnected")
-            self._post_signal('net_disconnected', None)
+        # 오디오 캡처 시작
+        self.audio_capture = AudioCapture(
+            level_callback=self._on_audio_level,
+            error_callback=self._on_audio_error,
+        )
+        self.audio_capture.start(mic, self.send_q)
+        self._log(f"[AUDIO] capture started on '{mic.name}'")
 
-    def _net_thread(self, host, port, checkcode, wait_ack, do_ping):
-        
-        print(f"Net thread start: {host}:{port}, checkcode={checkcode}, wait_ack={wait_ack}, ping={do_ping}")
-        self._post_status("전송 시작")
+        # 서버 시작
+        self.server = NetAudioServer(
+            send_queue=self.send_q,
+            checkcode=checkcode,
+            host=host,
+            port=port,
+            status_cb=self._log,
+        )
+        self.server.start()
+        self._log(f"[SERVER] start listen on {host}:{port}, checkcode={checkcode}")
 
-        asyncio.run(self._net_sender(host, port, checkcode, wait_ack, do_ping))
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
 
-    # ---------- UI 루프 ----------
+    def _stop(self):
+        if self.server:
+            self.server.stop()
+            self.server = None
+            self._log("[SERVER] stopped")
+
+        if self.audio_capture:
+            self.audio_capture.stop()
+            self.audio_capture = None
+            self._log("[AUDIO] capture stopped")
+
+        self.btn_start.config(state="normal")
+        self.btn_stop.config(state="disabled")
+
+    def _on_close(self):
+        self._stop()
+        self.destroy()
+
+    # ---------- UI 틱 ----------
     def _ui_tick(self):
-        got = False
+        got_level = False
 
-        # A) 상태/시그널 큐를 먼저 모두 비움 (UI 스레드 안전)
         while True:
             try:
                 item = self.ui_q.get_nowait()
             except queue.Empty:
                 break
+
             if not item:
                 continue
-            if item[0] == 'status':
-                _, msg = item
-                self._set_status(msg)
-            elif item[0] == 'signal':
-                _, name, payload = item
-                if name == 'net_connected':
-                    if self.btn_disconnect: self.btn_disconnect.config(state='normal')
-                    if self.btn_connect: self.btn_connect.config(state='disabled')
-                elif name == 'net_connect_fail':
-                    if self.btn_connect: self.btn_connect.config(state='normal')
-                    if self.btn_disconnect: self.btn_disconnect.config(state='disabled')
-                elif name == 'net_disconnected':
-                    if self.btn_connect: self.btn_connect.config(state='normal')
-                    if self.btn_disconnect: self.btn_disconnect.config(state='disabled')
-                elif name == 'net_send_fail':
-                    if self.btn_connect: self.btn_connect.config(state='normal')
-                    if self.btn_disconnect: self.btn_disconnect.config(state='disabled')
-                elif name == 'net_ack_nonzero':
-                    self._set_status(f"[NET] nonzero ACK: {payload}")
-                # net_ping_* 는 상태바만으로 충분
 
-        # B) 오디오 큐를 끝까지 비움 (여기서 dBFS 계산 및 막대 갱신 트리거)
-        while True:
-            try:
-                item = self.audio_q.get_nowait()
-            except queue.Empty:
+            tag = item[0]
+
+            if tag == "status":
+                _, msg = item
+                if self.statusbar:
+                    self.statusbar.config(text=msg)
+                print(msg)
+
+            elif tag == "level":
+                _, db = item
+                self.current_dbfs = (
+                    self.RMS_SMOOTH * self.current_dbfs
+                    + (1.0 - self.RMS_SMOOTH) * db
+                )
+                got_level = True
+            elif tag == "server_event":
+                _, ev_tag, payload = item
+                if ev_tag == "status":
+                    self.statusbar.config(text=payload)
+                    print(payload)
+
+                elif ev_tag == "client_count":
+                    # UI 레이블 갱신
+                    self.lbl_clients.config(text=f"Clients: {payload}")
+
+            elif tag == "error":
+                _, msg = item
+                if self.statusbar:
+                    self.statusbar.config(text=msg)
+                print(msg)
+                messagebox.showerror("오디오 오류", msg)
+                # 오류 발생 시 자동 정지
+                self._stop()
                 break
 
-            if isinstance(item, np.ndarray):
-                db = self._dbfs_from_chunk(item)
-                self.current_dbfs = (self.RMS_SMOOTH * self.current_dbfs) + ((1 - self.RMS_SMOOTH) * db)
-                got = True
-                continue
-
-            if isinstance(item, tuple) and len(item) >= 2:
-                tag = str(item[0]).lower().lstrip('_')
-                msg = str(item[1])
-                if 'error' in tag:
-                    self._set_status(msg)
-                    self._stop_capture_ui()
-                    messagebox.showerror("오디오 오류", msg)
-                    break
-
-        if got and self.pbar and self.lbl_db:
+        if got_level and self.pbar and self.lbl_db:
             pct = self._dbfs_to_percent(self.current_dbfs)
-            self.pbar['value'] = pct
-            self.lbl_db.config(text=f"RMS: {self.current_dbfs:6.1f} dBFS ({pct:3d}%)")
+            self.pbar["value"] = pct
+            self.lbl_db.config(
+                text=f"RMS: {self.current_dbfs:6.1f} dBFS ({pct:3d}%)"
+            )
 
         self.after(33, self._ui_tick)
 
-    # ---------- 버튼 ----------
-    def _start(self):
-        if self.cap_thread and self.cap_thread.is_alive():
-            return
-        mics = self._list_loopback_mics()
-        idx = self.cmb_devices.current()
-        if idx < 0:
-            messagebox.showwarning("장치", "Loopback 장치를 선택하세요")
-            return
-        mic = mics[idx]
-
-        self.stop_event.clear()
-        self.cap_thread = threading.Thread(target=self._capture_worker, args=(mic,), daemon=True)
-        self.cap_thread.start()
-        
-        self.btn_start.config(state='disabled')
-        self.btn_stop.config(state='normal')
-        self.btn_connect.config(state='normal')
-        self.btn_disconnect.config(state='disabled')
-        self._set_status("캡처시작")
-
-    def _stop(self):
-        self._stop_capture_ui()
-        self._set_status("중지됨")
-
-    def _stop_capture_ui(self):
-        self.stop_event.set()
-        self.btn_start.config(state='normal')
-        self.btn_stop.config(state='disabled')
-        self.btn_connect.config(state='disabled')
-        self.btn_disconnect.config(state='disabled')
-
-
-    def _on_connect(self):
-        host = self.ent_server_ip.get().strip()
-        port = int(self.ent_server_port.get())
-        checkcode = int(self.ent_checkcode.get())
-
-        self.stop_event_net.clear()
-        
-        self.net_thread = threading.Thread(
-            target=self._net_thread,
-            args=(host, port, checkcode,
-                    self.var_wait_ack.get(),
-                    self.var_ping_on_start.get()),
-            daemon=True)
-        self.net_thread.start()
-
-        self.btn_connect.config(state='disabled')
-        self.btn_disconnect.config(state='disabled')
-        self._set_status(f"대기 중")
-
-
-    def _on_disconnect(self):
-        self.stop_event_net.set()
-        if self.net_thread:
-            self.net_thread.join()
-            self.net_thread = None
-        self.btn_connect.config(state='normal')
-        self.btn_disconnect.config(state='disabled')
-        self._set_status("연결끊김")
-
-
-    def _on_close(self):
-        self.stop_event.set()
-        self.destroy()
-
-    # ---------- UI ----------
-    def _build_ui(self):
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
-
-        # 장치 선택
-        mics = self._list_loopback_mics()
-        names = [m.name for m in mics] if mics else ["(없음)"]
-        self.cmb_devices = ttk.Combobox(frm, values=names, state="readonly", width=50)
-        self.cmb_devices.pack(anchor="w")
-        if mics:
-            self.cmb_devices.current(0)
-
-        # 서버 설정
-        f2 = ttk.Frame(frm)
-        f2.pack(fill="x", pady=8)
-        ttk.Label(f2, text="IP").pack(side="left")
-        self.ent_server_ip = ttk.Entry(f2, width=15)
-        self.ent_server_ip.pack(side="left", padx=4)
-        self.ent_server_ip.insert(0, "127.0.0.1")
-        ttk.Label(f2, text="Port").pack(side="left")
-        self.ent_server_port = ttk.Entry(f2, width=6)
-        self.ent_server_port.pack(side="left", padx=4)
-        self.ent_server_port.insert(0, "26070")
-        ttk.Label(f2, text="Checkcode").pack(side="left")
-        self.ent_checkcode = ttk.Entry(f2, width=10)
-        self.ent_checkcode.pack(side="left", padx=4)
-        self.ent_checkcode.insert(0, "20250918")
-        ttk.Checkbutton(f2, text="Ping(99)", variable=self.var_ping_on_start).pack(side="left", padx=4)
-        ttk.Checkbutton(f2, text="ACK 대기", variable=self.var_wait_ack).pack(side="left", padx=4)
-
-        # 게이지
-        self.pbar = ttk.Progressbar(frm, orient="horizontal", length=420, mode="determinate", maximum=100)
-        self.pbar.pack(fill="x", pady=6)
-        self.lbl_db = ttk.Label(frm, text="RMS: --- dBFS")
-        self.lbl_db.pack(anchor="w")
-
-        # 버튼
-        f3 = ttk.Frame(frm)
-        f3.pack(fill="x", pady=6)
-        self.btn_start = ttk.Button(f3, text="시작", command=self._start)
-        self.btn_start.pack(side="left", padx=4)
-        self.btn_stop = ttk.Button(f3, text="정지", command=self._stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=4)
-
-        self.btn_disconnect = ttk.Button(f3, text="연결끊기", command=self._on_disconnect, state="disabled")
-        self.btn_disconnect.pack(side="right", padx=4)
-        self.btn_connect = ttk.Button(f3, text="연결", command=self._on_connect , state="disabled")
-        self.btn_connect.pack(side="right", padx=4)        
-
-        # 상태
-        self.statusbar = ttk.Label(self, text="대기 중", anchor="w", relief="sunken")
-        self.statusbar.pack(side="bottom", fill="x")
-
-    def _set_status(self, msg):
-        if self.statusbar:
-            self.statusbar.config(text=msg)
-
 
 if __name__ == "__main__":
-    print("Starting mainloop...")
     App().mainloop()
