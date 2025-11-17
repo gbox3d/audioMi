@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='audioMi_server',
+    name='audioMi_server_le',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

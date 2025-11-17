@@ -20,6 +20,8 @@ uv sync --frozen
 ```bash
 pyinstaller --onefile --windowed --name="audioMi"  main.py
 pyinstaller --windowed --name="audioMi"  main.py
+
+pyinstaller audioMi.spec
 ```
 
 ## 서버 
