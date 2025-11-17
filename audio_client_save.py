@@ -78,14 +78,14 @@ async def audio_client_save(
         print("[CLIENT] connected")
 
         # ---- 1) PING 보내기 ----
-        ping_packet = struct.pack("!ii", checkcode, REQUEST_PING)
+        ping_packet = struct.pack("<ii", checkcode, REQUEST_PING)
         writer.write(ping_packet)
         await writer.drain()
         print("[CLIENT] ping sent")
 
-        # ACK 읽기 ( !iiB = checkcode, cmd(=99), status )
+        # ACK 읽기 ( <iiB = checkcode, cmd(=99), status )
         ack = await reader.readexactly(9)
-        recv_checkcode, cmd, status = struct.unpack("!iiB", ack)
+        recv_checkcode, cmd, status = struct.unpack("<iiB", ack)
 
         if recv_checkcode != checkcode or cmd != REQUEST_PING or status != 0:
             print(
@@ -101,9 +101,9 @@ async def audio_client_save(
 
         # ---- 2) 오디오 패킷 수신 루프 ----
         while True:
-            # header: !ii = (checkcode, cmd)
+            # header: <ii = (checkcode, cmd)
             header = await reader.readexactly(8)
-            h_check, cmd = struct.unpack("!ii", header)
+            h_check, cmd = struct.unpack("<ii", header)
 
             if h_check != checkcode:
                 print(f"[CLIENT] invalid checkcode in header: {h_check}")
@@ -118,9 +118,9 @@ async def audio_client_save(
                 # 현재 프로토콜에서는 cmd=1에만 data가 붙는다고 가정.
                 continue
 
-            # size: !i
+            # size: <i
             size_raw = await reader.readexactly(4)
-            (size,) = struct.unpack("!i", size_raw)
+            (size,) = struct.unpack("<i", size_raw)
 
             if size <= 0:
                 print(f"[CLIENT] invalid audio size={size}, skip")

@@ -115,7 +115,7 @@ class NetAudioServer:
                 except asyncio.IncompleteReadError:
                     break
 
-                recv_checkcode, cmd = struct.unpack("!ii", header)
+                recv_checkcode, cmd = struct.unpack("<ii", header)
                 if recv_checkcode != self.checkcode:
                     self._log(
                         f"[CLIENT {addr}] invalid checkcode: {recv_checkcode}"
@@ -124,7 +124,7 @@ class NetAudioServer:
 
                 if cmd == REQUEST_PING:
                     # PING ACK
-                    ack = struct.pack("!iiB", self.checkcode, REQUEST_PING, 0)
+                    ack = struct.pack("<iiB", self.checkcode, REQUEST_PING, 0)
                     try:
                         writer.write(ack)
                         await writer.drain()
@@ -164,8 +164,8 @@ class NetAudioServer:
                 # 접속자가 없으면 그냥 버림
                 continue
 
-            header = struct.pack("!ii", self.checkcode, REQUEST_AUDIO)
-            size = struct.pack("!i", len(data))
+            header = struct.pack("<ii", self.checkcode, REQUEST_AUDIO)
+            size = struct.pack("<i", len(data))
             packet = header + size + data
 
             dead_clients = []

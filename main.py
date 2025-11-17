@@ -1,7 +1,7 @@
 # main.py
 #########################################################
 # 위 주석은 수정하지 마세요.
-# file: main.py
+# file: main.py (LE)
 # author: gbox3d
 # date: 2025-11-13
 # env : uv add soundcard==0.4.5 numpy scipy
@@ -17,11 +17,8 @@ import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from audio_module import (
-    AudioCapture,
-    list_loopback_mics,
-    dbfs_from_chunk,   # 직접 쓰진 않지만 필요하면 사용 가능
-)
+from audio_module import AudioCapture
+from utils import list_loopback_mics, dbfs_from_chunk  # ✅ 올바른 위치
 from net_server import NetAudioServer
 
 
@@ -41,7 +38,7 @@ class App(tk.Tk):
         self.default_checkcode = os.getenv("CHECKCODE", "20250918")
         
         
-        self.title(f"Loopback Audio Server v{self.__VERSION__}")
+        self.title(f"Loopback Audio Server v{self.__VERSION__} LE")
 
         # 큐: UI 갱신용
         self.ui_q = queue.Queue(maxsize=200)
