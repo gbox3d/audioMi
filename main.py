@@ -21,18 +21,23 @@ from audio_module import AudioCapture
 from utils import list_loopback_mics, dbfs_from_chunk  # ✅ 올바른 위치
 from net_server import NetAudioServer
 
-
+from etc import resource_path, get_base_dir
 
 class App(tk.Tk):
     DBFS_FLOOR = -60.0
     RMS_SMOOTH = 0.2
-    __VERSION__ = "0.1.0"
+    __VERSION__ = "0.1.1"
 
     def __init__(self):
         super().__init__()
         
-        # .env 값 읽기
-        load_dotenv()
+        # 1. .env 파일 경로 설정 (실행파일과 같은 위치)
+        env_path = os.path.join(get_base_dir(), ".env")
+        
+        # 2. 로드 시도 및 결과 확인
+        is_loaded = load_dotenv(env_path)
+        
+        # 3. 환경 변수 읽기
         self.default_host = os.getenv("HOST", "0.0.0.0")
         self.default_port = os.getenv("PORT", "26070")
         self.default_checkcode = os.getenv("CHECKCODE", "20250918")
@@ -68,6 +73,20 @@ class App(tk.Tk):
 
         self.after(33, self._ui_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        
+        # 4. 다이얼로그 표시 로직
+        if is_loaded:
+            msg = (f".env 설정을 불러왔습니다.\n\n"
+                   f"Path: {env_path}\n"
+                   f"HOST: {self.default_host}\n"
+                   f"PORT: {self.default_port}\n"
+                   f"CHECKCODE: {self.default_checkcode}")
+            messagebox.showinfo("설정 로드 성공", msg)
+        else:
+            msg = (f".env 파일을 찾을 수 없어 기본값으로 시작합니다.\n\n"
+                   f"시도한 경로: {env_path}\n"
+                   f"기본 PORT: {self.default_port}")
+            messagebox.showwarning("설정 로드 실패", msg)
 
     # ---------- 내부 유틸 ----------
     def _post_ui(self, item):
@@ -91,6 +110,10 @@ class App(tk.Tk):
 
     # ---------- UI 빌드 ----------
     def _build_ui(self):
+        
+        icon_path = resource_path("icon.png")
+        self.iconphoto(False, tk.PhotoImage(file=icon_path))
+        
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill="both", expand=True)
 
