@@ -26,7 +26,7 @@ from etc import resource_path, get_base_dir
 class App(tk.Tk):
     DBFS_FLOOR = -60.0
     RMS_SMOOTH = 0.2
-    __VERSION__ = "0.1.1"
+    __VERSION__ = "0.1.2"
 
     def __init__(self):
         super().__init__()

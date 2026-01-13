@@ -38,17 +38,27 @@ def float32_to_pcm16_resampled(chunk: np.ndarray, in_sr: int, out_sr: int) -> by
     float32 [-1,1] → mono int16 → bytes
     필요 시 resample_poly로 리샘플링.
     """
+    # 1. Stereo -> Mono Mixdown
     if chunk.ndim == 2:
         mono = np.mean(chunk, axis=1)
     else:
         mono = chunk
 
+    # 2. 1차 클리핑
     mono = np.clip(mono, -1.0, 1.0)
 
+    # 3. 리샘플링
     if in_sr != out_sr:
         gcd = np.gcd(in_sr, out_sr)
         up, down = out_sr // gcd, in_sr // gcd
         mono = resample_poly(mono, up, down)
 
-    pcm16 = (mono * 32767.0).astype(np.int16)
+    # 4. [중요 수정] 증폭 및 2차 클리핑 (오버플로우 방지)
+    # 리샘플링 후 값이 1.0을 살짝 넘을 수 있으므로 변환 직전에 확실히 자릅니다.
+    scaled = mono * 32767.0
+    scaled = np.clip(scaled, -32768.0, 32767.0) # <--- 이 줄이 핵심입니다!
+
+    # 5. int16 변환
+    pcm16 = scaled.astype(np.int16)
+    
     return pcm16.tobytes()
