@@ -10,6 +10,17 @@
 #       Tkinter UI 로 서버를 제어.
 #########################################################
 
+"""
+0.1.3 LE 변경사항:
+- 캡처 모드 추가: Loopback / Mic / Both 선택 지원
+- 장치 관리 분리: Loopback 장치와 입력 Mic 장치 각각 조회/선택
+- 오디오 캡처 다중화: 모드에 따라 Loopback, Mic 동시/개별 캡처 시작
+- 전송 커맨드 분리: Loopback=DEFAULT_CMD_LOOPBACK, Mic=DEFAULT_CMD_MIC
+- UI 상태 개선: 모드 선택에 따라 장치 콤보 활성/비활성 전환
+- 이벤트 포맷 확장: 레벨/오류 콜백에 source 포함([AUDIO:LOOPBACK], [AUDIO:MIC])
+- 앱 버전 갱신: 0.1.2 -> 0.1.3
+"""
+
 from dotenv import load_dotenv
 import os
 
@@ -17,8 +28,8 @@ import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from audio_module import AudioCapture
-from utils import list_loopback_mics, dbfs_from_chunk  # ✅ 올바른 위치
+from audio_module import AudioCapture, DEFAULT_CMD_LOOPBACK, DEFAULT_CMD_MIC
+from utils import list_loopback_mics, list_input_mics
 from net_server import NetAudioServer
 
 from etc import resource_path, get_base_dir
@@ -26,7 +37,10 @@ from etc import resource_path, get_base_dir
 class App(tk.Tk):
     DBFS_FLOOR = -60.0
     RMS_SMOOTH = 0.2
-    __VERSION__ = "0.1.2"
+    __VERSION__ = "0.1.3"
+    MODE_LOOPBACK = "Loopback"
+    MODE_MIC = "Mic"
+    MODE_BOTH = "Both"
 
     def __init__(self):
         super().__init__()
@@ -51,14 +65,18 @@ class App(tk.Tk):
         # 오디오 데이터 전송용 큐
         self.send_q = queue.Queue(maxsize=200)
 
-        self.mics = []
-        self.audio_capture = None
+        self.loopback_mics = []
+        self.input_mics = []
+        self.loopback_capture = None
+        self.mic_capture = None
         self.server = None
 
         self.current_dbfs = self.DBFS_FLOOR
 
         # UI 위젯 핸들
+        self.cmb_mode = None
         self.cmb_devices = None
+        self.cmb_mic_devices = None
         self.ent_host = None
         self.ent_port = None
         self.ent_checkcode = None
@@ -70,6 +88,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._load_devices()
+        self._update_mode_ui()
 
         self.after(33, self._ui_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -98,11 +117,11 @@ class App(tk.Tk):
     def _log(self, tag: str, payload=None):
         self._post_ui(("server_event", tag, payload))
 
-    def _on_audio_level(self, db: float):
-        self._post_ui(("level", db))
+    def _on_audio_level(self, source: str, db: float):
+        self._post_ui(("level", source, db))
 
-    def _on_audio_error(self, e: Exception):
-        self._post_ui(("error", f"[AUDIO] {e}"))
+    def _on_audio_error(self, source: str, e: Exception):
+        self._post_ui(("error", f"[AUDIO:{source.upper()}] {e}"))
 
     def _dbfs_to_percent(self, dbfs: float) -> int:
         v = (dbfs - self.DBFS_FLOOR) / (0.0 - self.DBFS_FLOOR)
@@ -117,10 +136,26 @@ class App(tk.Tk):
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill="both", expand=True)
 
+        # 캡처 모드
+        ttk.Label(frm, text="Capture Mode").pack(anchor="w")
+        self.cmb_mode = ttk.Combobox(
+            frm,
+            state="readonly",
+            values=[self.MODE_LOOPBACK, self.MODE_MIC, self.MODE_BOTH],
+            width=20,
+        )
+        self.cmb_mode.current(0)
+        self.cmb_mode.pack(anchor="w", fill="x", pady=(0, 8))
+        self.cmb_mode.bind("<<ComboboxSelected>>", lambda _e: self._update_mode_ui())
+
         # 장치 선택
         ttk.Label(frm, text="Loopback 장치").pack(anchor="w")
         self.cmb_devices = ttk.Combobox(frm, state="readonly", width=50)
         self.cmb_devices.pack(anchor="w", fill="x", pady=(0, 8))
+
+        ttk.Label(frm, text="Mic 장치").pack(anchor="w")
+        self.cmb_mic_devices = ttk.Combobox(frm, state="readonly", width=50)
+        self.cmb_mic_devices.pack(anchor="w", fill="x", pady=(0, 8))
 
         # 서버 설정
         f_srv = ttk.Frame(frm)
@@ -179,28 +214,65 @@ class App(tk.Tk):
         self.statusbar.pack(side="bottom", fill="x")
 
     def _load_devices(self):
-        self.mics = list_loopback_mics()
-        if not self.mics:
+        self.loopback_mics = list_loopback_mics()
+        self.input_mics = list_input_mics()
+
+        if not self.loopback_mics:
             self.cmb_devices["values"] = ["(Loopback 장치 없음)"]
             self.cmb_devices.current(0)
             self._log("Loopback 장치를 찾을 수 없습니다.")
         else:
-            names = [m.name for m in self.mics]
+            names = [m.name for m in self.loopback_mics]
             self.cmb_devices["values"] = names
             self.cmb_devices.current(0)
-            self._log(f"Loopback 장치 {len(self.mics)}개 발견")
+            self._log(f"Loopback 장치 {len(self.loopback_mics)}개 발견")
+
+        if not self.input_mics:
+            self.cmb_mic_devices["values"] = ["(입력 Mic 장치 없음)"]
+            self.cmb_mic_devices.current(0)
+            self._log("입력 Mic 장치를 찾을 수 없습니다.")
+        else:
+            names = [m.name for m in self.input_mics]
+            self.cmb_mic_devices["values"] = names
+            self.cmb_mic_devices.current(0)
+            self._log(f"입력 Mic 장치 {len(self.input_mics)}개 발견")
+
+    def _update_mode_ui(self):
+        mode = self.cmb_mode.get() if self.cmb_mode else self.MODE_LOOPBACK
+        loopback_needed = mode in (self.MODE_LOOPBACK, self.MODE_BOTH)
+        mic_needed = mode in (self.MODE_MIC, self.MODE_BOTH)
+
+        self.cmb_devices.config(state="readonly" if loopback_needed else "disabled")
+        self.cmb_mic_devices.config(state="readonly" if mic_needed else "disabled")
 
     # ---------- UI 이벤트 ----------
     def _start(self):
-        if not self.mics:
-            messagebox.showerror("장치", "Loopback 장치를 찾을 수 없습니다.")
-            return
+        mode = self.cmb_mode.get()
+        use_loopback = mode in (self.MODE_LOOPBACK, self.MODE_BOTH)
+        use_mic = mode in (self.MODE_MIC, self.MODE_BOTH)
 
-        idx = self.cmb_devices.current()
-        if idx < 0 or idx >= len(self.mics):
-            messagebox.showerror("장치", "Loopback 장치를 선택하세요.")
-            return
-        mic = self.mics[idx]
+        loopback_device = None
+        mic_device = None
+
+        if use_loopback:
+            if not self.loopback_mics:
+                messagebox.showerror("장치", "Loopback 장치를 찾을 수 없습니다.")
+                return
+            idx = self.cmb_devices.current()
+            if idx < 0 or idx >= len(self.loopback_mics):
+                messagebox.showerror("장치", "Loopback 장치를 선택하세요.")
+                return
+            loopback_device = self.loopback_mics[idx]
+
+        if use_mic:
+            if not self.input_mics:
+                messagebox.showerror("장치", "입력 Mic 장치를 찾을 수 없습니다.")
+                return
+            idx = self.cmb_mic_devices.current()
+            if idx < 0 or idx >= len(self.input_mics):
+                messagebox.showerror("장치", "입력 Mic 장치를 선택하세요.")
+                return
+            mic_device = self.input_mics[idx]
 
         host = self.ent_host.get().strip()
         try:
@@ -209,14 +281,6 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("설정", "Port/Checkcode 는 정수여야 합니다.")
             return
-
-        # 오디오 캡처 시작
-        self.audio_capture = AudioCapture(
-            level_callback=self._on_audio_level,
-            error_callback=self._on_audio_error,
-        )
-        self.audio_capture.start(mic, self.send_q)
-        self._log(f"[AUDIO] capture started on '{mic.name}'")
 
         # 서버 시작
         self.server = NetAudioServer(
@@ -229,6 +293,33 @@ class App(tk.Tk):
         self.server.start()
         self._log(f"[SERVER] start listen on {host}:{port}, checkcode={checkcode}")
 
+        # 오디오 캡처 시작
+        if use_loopback and loopback_device is not None:
+            self.loopback_capture = AudioCapture(
+                level_callback=self._on_audio_level,
+                error_callback=self._on_audio_error,
+            )
+            self.loopback_capture.start(
+                loopback_device,
+                self.send_q,
+                output_cmd=DEFAULT_CMD_LOOPBACK,
+                source_name="loopback",
+            )
+            self._log(f"[AUDIO:LOOPBACK] capture started on '{loopback_device.name}'")
+
+        if use_mic and mic_device is not None:
+            self.mic_capture = AudioCapture(
+                level_callback=self._on_audio_level,
+                error_callback=self._on_audio_error,
+            )
+            self.mic_capture.start(
+                mic_device,
+                self.send_q,
+                output_cmd=DEFAULT_CMD_MIC,
+                source_name="mic",
+            )
+            self._log(f"[AUDIO:MIC] capture started on '{mic_device.name}'")
+
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
 
@@ -238,10 +329,15 @@ class App(tk.Tk):
             self.server = None
             self._log("[SERVER] stopped")
 
-        if self.audio_capture:
-            self.audio_capture.stop()
-            self.audio_capture = None
-            self._log("[AUDIO] capture stopped")
+        if self.loopback_capture:
+            self.loopback_capture.stop()
+            self.loopback_capture = None
+            self._log("[AUDIO:LOOPBACK] capture stopped")
+
+        if self.mic_capture:
+            self.mic_capture.stop()
+            self.mic_capture = None
+            self._log("[AUDIO:MIC] capture stopped")
 
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
@@ -272,7 +368,7 @@ class App(tk.Tk):
                 print(msg)
 
             elif tag == "level":
-                _, db = item
+                _, _source, db = item
                 self.current_dbfs = (
                     self.RMS_SMOOTH * self.current_dbfs
                     + (1.0 - self.RMS_SMOOTH) * db

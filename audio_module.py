@@ -8,6 +8,8 @@ from utils import float32_to_pcm16_resampled, dbfs_from_chunk
 DEFAULT_SAMPLE_RATE = 48000   # loopback 캡처
 DEFAULT_TARGET_SR = 16000     # 네트워크 전송용
 DEFAULT_CHUNK = 1024
+DEFAULT_CMD_LOOPBACK = 0x01
+DEFAULT_CMD_MIC = 0x02
 
 
 class AudioCapture:
@@ -34,42 +36,70 @@ class AudioCapture:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def start(self, mic, send_queue: queue.Queue) -> None:
+    def _emit_level(self, source: str, db: float) -> None:
+        if self.level_callback is None:
+            return
+        try:
+            self.level_callback(source, db)
+        except TypeError:
+            self.level_callback(db)
+
+    def _emit_error(self, source: str, err: Exception) -> None:
+        if self.error_callback is None:
+            return
+        try:
+            self.error_callback(source, err)
+        except TypeError:
+            self.error_callback(err)
+
+    def start(
+        self,
+        mic,
+        send_queue: queue.Queue,
+        output_cmd: int = DEFAULT_CMD_LOOPBACK,
+        source_name: str = "loopback",
+    ) -> None:
         """캡처 스레드 시작."""
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._capture_worker, args=(mic, send_queue), daemon=True
+            target=self._capture_worker,
+            args=(mic, send_queue, output_cmd, source_name),
+            daemon=True,
         )
         self._thread.start()
 
-    def _capture_worker(self, mic, send_queue: queue.Queue) -> None:
+    def _capture_worker(
+        self,
+        mic,
+        send_queue: queue.Queue,
+        output_cmd: int,
+        source_name: str,
+    ) -> None:
         try:
             with mic.recorder(samplerate=self.sample_rate) as rec:
                 while not self._stop_event.is_set():
                     data = rec.record(numframes=self.chunk)
 
                     # dBFS 모니터링 콜백
-                    if self.level_callback is not None:
-                        try:
-                            db = dbfs_from_chunk(data)
-                            self.level_callback(db)
-                        except Exception:
-                            pass
+                    try:
+                        db = dbfs_from_chunk(data)
+                        self._emit_level(source_name, db)
+                    except Exception:
+                        pass
 
                     # 서버 전송용 큐로 PCM16 (target_sr) 넣기
                     try:
                         pcm = float32_to_pcm16_resampled(
                             data, self.sample_rate, self.target_sr
                         )
-                        send_queue.put_nowait(pcm)
+                        send_queue.put_nowait((output_cmd, pcm))
                     except queue.Full:
                         # 버퍼가 가득 찼으면 과감히 버려도 됨
                         pass
         except Exception as e:
-            if self.error_callback is not None:
-                self.error_callback(e)
+            self._emit_error(source_name, e)
 
     def stop(self) -> None:
         """캡처 스레드 종료."""

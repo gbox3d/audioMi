@@ -6,7 +6,8 @@ import queue
 from contextlib import suppress
 from typing import Set, Optional, Callable
 
-REQUEST_AUDIO = 0x01   # 1번 커맨드: 오디오 푸시
+REQUEST_AUDIO_LOOPBACK = 0x01
+REQUEST_AUDIO_MIC = 0x02
 REQUEST_PING  = 99
 
 # StatusCallback = Callable[[str], None]
@@ -33,7 +34,7 @@ class NetAudioServer:
         self.checkcode = checkcode
         self.host = host
         self.port = port
-        self.status_cb = status_cb or (lambda msg: None)
+        self.status_cb = status_cb or (lambda _tag, _payload=None: None)
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -155,16 +156,30 @@ class NetAudioServer:
         """
         while not self._stop_event.is_set():
             try:
-                data = self.send_queue.get_nowait()
+                item = self.send_queue.get_nowait()
             except queue.Empty:
                 await asyncio.sleep(0.01)
+                continue
+
+            cmd = REQUEST_AUDIO_LOOPBACK
+            data = None
+            if isinstance(item, tuple) and len(item) == 2:
+                maybe_cmd, maybe_data = item
+                if isinstance(maybe_cmd, int) and isinstance(maybe_data, (bytes, bytearray)):
+                    cmd = maybe_cmd
+                    data = bytes(maybe_data)
+            elif isinstance(item, (bytes, bytearray)):
+                # 하위호환: legacy producer(bytes only) -> loopback cmd(1)
+                data = bytes(item)
+
+            if data is None:
                 continue
 
             if not self._clients:
                 # 접속자가 없으면 그냥 버림
                 continue
 
-            header = struct.pack("<ii", self.checkcode, REQUEST_AUDIO)
+            header = struct.pack("<ii", self.checkcode, cmd)
             size = struct.pack("<i", len(data))
             packet = header + size + data
 

@@ -2,7 +2,17 @@
 
 **“PC 스피커(Loopback)로 나가는 소리를 실시간으로 캡처해서 TCP 서버로 송출하고, 클라이언트가 그걸 받아서 파일로 저장할 수 있는 유틸리티 세트”**입니다.
 
-**통신방식은 Little Endian 기반**  
+**통신방식은 Little Endian 기반 (`<ii`, `<i`)**  
+
+## 0.1.3 LE 변경사항
+
+- 캡처 모드 추가: `Loopback` / `Mic` / `Both` 선택 지원
+- 장치 관리 분리: Loopback 장치와 입력 Mic 장치 각각 조회/선택
+- 오디오 캡처 다중화: 모드에 따라 Loopback, Mic 동시/개별 캡처 시작
+- 전송 커맨드 분리: Loopback=`DEFAULT_CMD_LOOPBACK`, Mic=`DEFAULT_CMD_MIC`
+- UI 상태 개선: 모드 선택에 따라 장치 콤보 활성/비활성 전환
+- 이벤트 포맷 확장: 레벨/오류 콜백에 source 포함 (`[AUDIO:LOOPBACK]`, `[AUDIO:MIC]`)
+- 앱 버전 갱신: `0.1.2` -> `0.1.3`
 
 ## setup
 
@@ -148,7 +158,9 @@ asyncio 기반 TCP 서버
 
 핵심 상수
 
-REQUEST_AUDIO = 0x01 : 오디오 전송 커맨드
+REQUEST_AUDIO_LOOPBACK = 0x01 : Loopback 오디오 전송 커맨드
+
+REQUEST_AUDIO_MIC = 0x02 : Mic 오디오 전송 커맨드
 
 REQUEST_PING = 99 : 클라이언트 → 서버 핑 요청 코드
 
@@ -370,20 +382,23 @@ WAV 파일 닫기
 
 3. 통신 프로토콜 요약
 
-엔디언: ! → network(big-endian)
+엔디언: `<` → little-endian
 
 3-1. 클라이언트 → 서버 (PING)
-[8바이트] !ii = (checkcode:int, cmd:int=99)
+[8바이트] `<ii` = (checkcode:int, cmd:int=99)
 
 
 서버 응답:
 
-[9바이트] !iiB = (checkcode:int, cmd:int=99, status:byte=0)
+[9바이트] `<iiB` = (checkcode:int, cmd:int=99, status:byte=0)
 
 3-2. 서버 → 클라이언트 (오디오 스트림)
-[8바이트] header = !ii = (checkcode:int, cmd:int=1)
-[4바이트] size   = !i  = (data_len:int)
+[8바이트] header = `<ii` = (checkcode:int, cmd:int=1|2)
+[4바이트] size   = `<i`  = (data_len:int)
 [size]    data   = PCM16 mono 16kHz raw bytes
+
+- `cmd=1` : loopback 스트림
+- `cmd=2` : mic 스트림
 
 
 클라이언트는 헤더/사이즈를 읽고, 그 길이만큼 readexactly로 data를 읽어 파일에 쓴다.

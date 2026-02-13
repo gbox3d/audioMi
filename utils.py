@@ -23,6 +23,25 @@ def list_loopback_mics():
     return loopbacks if loopbacks else mics
 
 
+def list_input_mics():
+    """
+    입력 마이크 장치 목록 반환 (loopback 제외).
+    기본 마이크를 최우선으로 배치.
+    """
+    mics = sc.all_microphones(include_loopback=False)
+    if not mics:
+        return []
+
+    try:
+        default_mic = sc.default_microphone()
+        if default_mic is not None:
+            return [default_mic] + [m for m in mics if m.name != default_mic.name]
+    except Exception:
+        pass
+
+    return mics
+
+
 def dbfs_from_chunk(chunk: np.ndarray) -> float:
     """float32 오디오 청크로부터 dBFS 계산."""
     if chunk.ndim == 2:
