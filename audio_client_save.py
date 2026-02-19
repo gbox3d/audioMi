@@ -1,13 +1,10 @@
 # audio_client_save.py
 """
-Loopback Audio Server 테스트용 클라이언트
+Audio Server 테스트용 클라이언트
 
 - 서버에 접속해서 PING(99) 전송
-- 서버가 push 해주는 cmd=1(REQUEST_AUDIO) 오디오 패킷을 계속 받아서
+- 서버가 push 해주는 cmd=1(loopback), cmd=2(mic) 오디오 패킷을 받아서
   로컬 WAV 파일로 저장하는 예제
-
-환경:
-  uv add numpy  (numpy는 꼭 필요하진 않지만, 후처리용으로 쓰고 싶으면)
 
 사용법:
   python audio_client_save.py
@@ -20,7 +17,8 @@ import signal
 import sys
 from typing import Optional
 
-REQUEST_AUDIO = 0x01
+REQUEST_AUDIO_LOOPBACK = 0x01
+REQUEST_AUDIO_MIC = 0x02
 REQUEST_PING = 99
 
 # ---- 서버 접속 설정 ----
@@ -29,7 +27,8 @@ PORT = 26070
 CHECKCODE = 20250918
 
 # ---- 저장 파일 / 포맷 ----
-OUTPUT_WAV = "capture_from_server.wav"
+OUTPUT_WAV_LOOPBACK = "capture_from_server_loopback.wav"
+OUTPUT_WAV_MIC = "capture_from_server_mic.wav"
 WAV_CHANNELS = 1       # mono
 WAV_SAMPLERATE = 16000 # 서버쪽에서 16kHz PCM16 보내는 것으로 가정
 WAV_SAMPWIDTH = 2      # 16bit = 2 bytes
@@ -58,20 +57,27 @@ async def audio_client_save(
     host: str,
     port: int,
     checkcode: int,
-    out_wav_path: str,
+    out_wav_loopback_path: str,
+    out_wav_mic_path: str,
 ) -> None:
     print(f"[CLIENT] connect to {host}:{port} (checkcode={checkcode}) ...")
 
     reader: Optional[asyncio.StreamReader] = None
     writer: Optional[asyncio.StreamWriter] = None
 
-    # WAV 파일 열기
-    wf = wave.open(out_wav_path, "wb")
-    wf.setnchannels(WAV_CHANNELS)
-    wf.setsampwidth(WAV_SAMPWIDTH)
-    wf.setframerate(WAV_SAMPLERATE)
+    # WAV 파일 열기 (cmd별 분리 저장)
+    wf_loopback = wave.open(out_wav_loopback_path, "wb")
+    wf_loopback.setnchannels(WAV_CHANNELS)
+    wf_loopback.setsampwidth(WAV_SAMPWIDTH)
+    wf_loopback.setframerate(WAV_SAMPLERATE)
 
-    total_bytes = 0
+    wf_mic = wave.open(out_wav_mic_path, "wb")
+    wf_mic.setnchannels(WAV_CHANNELS)
+    wf_mic.setsampwidth(WAV_SAMPWIDTH)
+    wf_mic.setframerate(WAV_SAMPLERATE)
+
+    total_bytes_loopback = 0
+    total_bytes_mic = 0
 
     try:
         reader, writer = await asyncio.open_connection(host, port)
@@ -96,7 +102,7 @@ async def audio_client_save(
 
         print(
             "[CLIENT] waiting for audio packets... "
-            "(Ctrl+C to stop, file will be saved on exit)"
+            "(Ctrl+C to stop, files will be saved on exit)"
         )
 
         # ---- 2) 오디오 패킷 수신 루프 ----
@@ -110,14 +116,6 @@ async def audio_client_save(
                 # 계속 받을지, 끊을지 선택 – 여기선 끊자
                 break
 
-            if cmd != REQUEST_AUDIO:
-                # 다른 커맨드는 일단 무시
-                print(f"[CLIENT] unknown cmd={cmd}, ignore payload")
-                # 만약 서버가 이런 패킷에 size+data 를 붙였다면
-                # size만큼 스킵해야 하지만,
-                # 현재 프로토콜에서는 cmd=1에만 data가 붙는다고 가정.
-                continue
-
             # size: <i
             size_raw = await reader.readexactly(4)
             (size,) = struct.unpack("<i", size_raw)
@@ -127,14 +125,22 @@ async def audio_client_save(
                 continue
 
             data = await reader.readexactly(size)
-            wf.writeframesraw(data)
-            total_bytes += len(data)
 
-            # 너무 자주 출력하면 시끄러우니까 대략적인 통계만
-            if total_bytes % (16000 * 2 * 5) < size:
-                # 대략 5초마다 한번
-                seconds = total_bytes / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
-                print(f"[CLIENT] received ~{seconds:5.1f} sec audio")
+            if cmd == REQUEST_AUDIO_LOOPBACK:
+                wf_loopback.writeframesraw(data)
+                total_bytes_loopback += len(data)
+                if total_bytes_loopback % (16000 * 2 * 5) < size:
+                    seconds = total_bytes_loopback / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
+                    print(f"[CLIENT] loopback received ~{seconds:5.1f} sec")
+            elif cmd == REQUEST_AUDIO_MIC:
+                wf_mic.writeframesraw(data)
+                total_bytes_mic += len(data)
+                if total_bytes_mic % (16000 * 2 * 5) < size:
+                    seconds = total_bytes_mic / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
+                    print(f"[CLIENT] mic received ~{seconds:5.1f} sec")
+            else:
+                # 알 수 없는 커맨드도 size/data는 읽어서 스트림 동기 유지
+                print(f"[CLIENT] unknown cmd={cmd}, payload skipped ({size} bytes)")
 
     except GracefulExit:
         print("\n[CLIENT] Ctrl+C detected, stopping...")
@@ -145,7 +151,11 @@ async def audio_client_save(
     finally:
         # WAV 파일 닫기
         try:
-            wf.close()
+            wf_loopback.close()
+        except Exception:
+            pass
+        try:
+            wf_mic.close()
         except Exception:
             pass
 
@@ -156,17 +166,32 @@ async def audio_client_save(
             except Exception:
                 pass
 
-        seconds = total_bytes / (WAV_SAMPLERATE * WAV_SAMPWIDTH) if total_bytes else 0
-        print(
-            f"[CLIENT] done. saved '{out_wav_path}' "
-            f"({total_bytes} bytes, ~{seconds:0.1f} sec)"
+        sec_loopback = (
+            total_bytes_loopback / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
+            if total_bytes_loopback
+            else 0
         )
+        sec_mic = (
+            total_bytes_mic / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
+            if total_bytes_mic
+            else 0
+        )
+        print(f"[CLIENT] done. loopback='{out_wav_loopback_path}' ({total_bytes_loopback} bytes, ~{sec_loopback:0.1f} sec)")
+        print(f"[CLIENT] done. mic='{out_wav_mic_path}' ({total_bytes_mic} bytes, ~{sec_mic:0.1f} sec)")
 
 
 def main():
     _setup_signal()
     try:
-        asyncio.run(audio_client_save(HOST, PORT, CHECKCODE, OUTPUT_WAV))
+        asyncio.run(
+            audio_client_save(
+                HOST,
+                PORT,
+                CHECKCODE,
+                OUTPUT_WAV_LOOPBACK,
+                OUTPUT_WAV_MIC,
+            )
+        )
     except GracefulExit:
         # 여기까지 올 일은 거의 없지만, 혹시 모를 cleanup
         print("[CLIENT] exited")
