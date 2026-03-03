@@ -11,11 +11,11 @@ Audio Server 테스트용 클라이언트
 """
 
 import asyncio
-import struct
-import wave
 import signal
+import struct
 import sys
 from typing import Optional
+import wave
 
 REQUEST_AUDIO_LOOPBACK = 0x01
 REQUEST_AUDIO_MIC = 0x02
@@ -25,6 +25,8 @@ REQUEST_PING = 99
 HOST = "127.0.0.1"
 PORT = 26070
 CHECKCODE = 20250918
+RECONNECT_DELAY_SEC = 3.0
+CONNECT_TIMEOUT_SEC = 5.0
 
 # ---- 저장 파일 / 포맷 ----
 OUTPUT_WAV_LOOPBACK = "capture_from_server_loopback.wav"
@@ -60,11 +62,6 @@ async def audio_client_save(
     out_wav_loopback_path: str,
     out_wav_mic_path: str,
 ) -> None:
-    print(f"[CLIENT] connect to {host}:{port} (checkcode={checkcode}) ...")
-
-    reader: Optional[asyncio.StreamReader] = None
-    writer: Optional[asyncio.StreamWriter] = None
-
     # WAV 파일 열기 (cmd별 분리 저장)
     wf_loopback = wave.open(out_wav_loopback_path, "wb")
     wf_loopback.setnchannels(WAV_CHANNELS)
@@ -78,76 +75,115 @@ async def audio_client_save(
 
     total_bytes_loopback = 0
     total_bytes_mic = 0
+    attempt = 0
 
     try:
-        reader, writer = await asyncio.open_connection(host, port)
-        print("[CLIENT] connected")
-
-        # ---- 1) PING 보내기 ----
-        ping_packet = struct.pack("<ii", checkcode, REQUEST_PING)
-        writer.write(ping_packet)
-        await writer.drain()
-        print("[CLIENT] ping sent")
-
-        # ACK 읽기 ( <iiB = checkcode, cmd(=99), status )
-        ack = await reader.readexactly(9)
-        recv_checkcode, cmd, status = struct.unpack("<iiB", ack)
-
-        if recv_checkcode != checkcode or cmd != REQUEST_PING or status != 0:
-            print(
-                f"[CLIENT] ping ACK invalid: check={recv_checkcode}, cmd={cmd}, status={status}"
-            )
-        else:
-            print("[CLIENT] ping OK")
-
-        print(
-            "[CLIENT] waiting for audio packets... "
-            "(Ctrl+C to stop, files will be saved on exit)"
-        )
-
-        # ---- 2) 오디오 패킷 수신 루프 ----
         while True:
-            # header: <ii = (checkcode, cmd)
-            header = await reader.readexactly(8)
-            h_check, cmd = struct.unpack("<ii", header)
+            reader: Optional[asyncio.StreamReader] = None
+            writer: Optional[asyncio.StreamWriter] = None
+            attempt += 1
 
-            if h_check != checkcode:
-                print(f"[CLIENT] invalid checkcode in header: {h_check}")
-                # 계속 받을지, 끊을지 선택 – 여기선 끊자
-                break
+            try:
+                print(
+                    f"[CLIENT] connect attempt #{attempt} "
+                    f"to {host}:{port} (checkcode={checkcode}) ..."
+                )
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=CONNECT_TIMEOUT_SEC,
+                )
+                print("[CLIENT] connected")
 
-            # size: <i
-            size_raw = await reader.readexactly(4)
-            (size,) = struct.unpack("<i", size_raw)
+                # ---- 1) PING 보내기 ----
+                ping_packet = struct.pack("<ii", checkcode, REQUEST_PING)
+                writer.write(ping_packet)
+                await writer.drain()
+                print("[CLIENT] ping sent")
 
-            if size <= 0:
-                print(f"[CLIENT] invalid audio size={size}, skip")
-                continue
+                # ACK 읽기 ( <iiB = checkcode, cmd(=99), status )
+                ack = await reader.readexactly(9)
+                recv_checkcode, cmd, status = struct.unpack("<iiB", ack)
 
-            data = await reader.readexactly(size)
+                if recv_checkcode != checkcode or cmd != REQUEST_PING or status != 0:
+                    raise ConnectionError(
+                        "[CLIENT] ping ACK invalid: "
+                        f"check={recv_checkcode}, cmd={cmd}, status={status}"
+                    )
 
-            if cmd == REQUEST_AUDIO_LOOPBACK:
-                wf_loopback.writeframesraw(data)
-                total_bytes_loopback += len(data)
-                if total_bytes_loopback % (16000 * 2 * 5) < size:
-                    seconds = total_bytes_loopback / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
-                    print(f"[CLIENT] loopback received ~{seconds:5.1f} sec")
-            elif cmd == REQUEST_AUDIO_MIC:
-                wf_mic.writeframesraw(data)
-                total_bytes_mic += len(data)
-                if total_bytes_mic % (16000 * 2 * 5) < size:
-                    seconds = total_bytes_mic / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
-                    print(f"[CLIENT] mic received ~{seconds:5.1f} sec")
-            else:
-                # 알 수 없는 커맨드도 size/data는 읽어서 스트림 동기 유지
-                print(f"[CLIENT] unknown cmd={cmd}, payload skipped ({size} bytes)")
+                print("[CLIENT] ping OK")
+                print(
+                    "[CLIENT] waiting for audio packets... "
+                    "(Ctrl+C to stop, files will be saved on exit)"
+                )
+
+                # ---- 2) 오디오 패킷 수신 루프 ----
+                while True:
+                    # header: <ii = (checkcode, cmd)
+                    header = await reader.readexactly(8)
+                    h_check, cmd = struct.unpack("<ii", header)
+
+                    if h_check != checkcode:
+                        raise ConnectionError(
+                            f"[CLIENT] invalid checkcode in header: {h_check}"
+                        )
+
+                    # size: <i
+                    size_raw = await reader.readexactly(4)
+                    (size,) = struct.unpack("<i", size_raw)
+
+                    if size <= 0:
+                        print(f"[CLIENT] invalid audio size={size}, skip")
+                        continue
+
+                    data = await reader.readexactly(size)
+
+                    if cmd == REQUEST_AUDIO_LOOPBACK:
+                        wf_loopback.writeframesraw(data)
+                        total_bytes_loopback += len(data)
+                        if total_bytes_loopback % (16000 * 2 * 5) < size:
+                            seconds = total_bytes_loopback / (
+                                WAV_SAMPLERATE * WAV_SAMPWIDTH
+                            )
+                            print(f"[CLIENT] loopback received ~{seconds:5.1f} sec")
+                    elif cmd == REQUEST_AUDIO_MIC:
+                        wf_mic.writeframesraw(data)
+                        total_bytes_mic += len(data)
+                        if total_bytes_mic % (16000 * 2 * 5) < size:
+                            seconds = total_bytes_mic / (
+                                WAV_SAMPLERATE * WAV_SAMPWIDTH
+                            )
+                            print(f"[CLIENT] mic received ~{seconds:5.1f} sec")
+                    else:
+                        # 알 수 없는 커맨드도 size/data는 읽어서 스트림 동기 유지
+                        print(
+                            f"[CLIENT] unknown cmd={cmd}, "
+                            f"payload skipped ({size} bytes)"
+                        )
+
+            except GracefulExit:
+                raise
+            except asyncio.IncompleteReadError:
+                print("[CLIENT] connection closed by server")
+            except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+                print(f"{e}")
+            except Exception as e:
+                print(f"[CLIENT] error: {e}")
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+            print(
+                "[CLIENT] server unavailable, "
+                f"retry in {RECONNECT_DELAY_SEC:0.1f} sec..."
+            )
+            await asyncio.sleep(RECONNECT_DELAY_SEC)
 
     except GracefulExit:
         print("\n[CLIENT] Ctrl+C detected, stopping...")
-    except asyncio.IncompleteReadError:
-        print("[CLIENT] connection closed by server")
-    except Exception as e:
-        print(f"[CLIENT] error: {e}")
     finally:
         # WAV 파일 닫기
         try:
@@ -159,13 +195,6 @@ async def audio_client_save(
         except Exception:
             pass
 
-        if writer is not None:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
         sec_loopback = (
             total_bytes_loopback / (WAV_SAMPLERATE * WAV_SAMPWIDTH)
             if total_bytes_loopback
@@ -176,8 +205,14 @@ async def audio_client_save(
             if total_bytes_mic
             else 0
         )
-        print(f"[CLIENT] done. loopback='{out_wav_loopback_path}' ({total_bytes_loopback} bytes, ~{sec_loopback:0.1f} sec)")
-        print(f"[CLIENT] done. mic='{out_wav_mic_path}' ({total_bytes_mic} bytes, ~{sec_mic:0.1f} sec)")
+        print(
+            f"[CLIENT] done. loopback='{out_wav_loopback_path}' "
+            f"({total_bytes_loopback} bytes, ~{sec_loopback:0.1f} sec)"
+        )
+        print(
+            f"[CLIENT] done. mic='{out_wav_mic_path}' "
+            f"({total_bytes_mic} bytes, ~{sec_mic:0.1f} sec)"
+        )
 
 
 def main():
